@@ -12,6 +12,7 @@ import logging
 from mutagen import File # type: ignore
 from mutagen.mp3 import MP3
 from mutagen.flac import FLAC
+from mutagen.id3 import ID3
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +34,13 @@ class AudioMetadata:
     comment: Optional[str] = None            # 注释
     lyrics: Optional[str] = None             # 歌词
     
-    # 音频技术信息
-    duration: Optional[float] = None         # 时长（秒）
-    sample_rate: Optional[int] = None        # 采样率
-    bitrate: Optional[int] = None            # 比特率（bps）
-    bits_per_sample: Optional[int] = None    # 位深度（无损格式）
-    channels: Optional[int] = None           # 声道数
+    # # 音频技术信息
+    # duration: Optional[float] = None         # 时长（秒）
+    # sample_rate: Optional[int] = None        # 采样率
+    # bitrate: Optional[int] = None            # 比特率（bps）
+    # bits_per_sample: Optional[int] = None    # 位深度（无损格式）
+    # channels: Optional[int] = None           # 声道数
+
 
 class AudioHandler:
     """
@@ -52,6 +54,21 @@ class AudioHandler:
         self._validate_audio_type()
         self._load_metadata()
 
+    def set_lyrics(self, lyrics: str):
+        if self.metadata is None:
+            raise ValueError("无法设置歌词，因为没有加载元数据")
+        # 删除空行
+        lyrics = '\n'.join(filter(str.strip, lyrics.splitlines()))
+        self.audio['lyrics'] = lyrics
+        self.audio.save()
+        self.metadata.lyrics = lyrics
+
+    def get_lyrics(self) -> Optional[str]:
+        if self.metadata is None:
+            return None
+        else:
+            return self.metadata.lyrics
+
     def _validate_audio_type(self):
         if isinstance(self.audio, MP3):
             self.audio_type = AudioType.MP3
@@ -61,24 +78,49 @@ class AudioHandler:
             raise ValueError(f"不支持的音频格式，请确认格式为mp3或flac，文件路径：{self.path}")
 
     def _load_metadata(self):
-        if self.audio is not None:
-            self.metadata = AudioMetadata(
-                title=self.audio.get('title'),
-                artist=self.audio.get('artist'),
-                album=self.audio.get('album'),
-                albumartist=self.audio.get('albumartist'),
-                genre=self.audio.get('genre'),
-                year=self.audio.get('date'),
-                track=self.audio.get('tracknumber'),
-                disc=self.audio.get('discnumber'),
-                comment=self.audio.get('comment'),
-                lyrics=self._extract_lyrics(),
-                duration=self.audio.info.get("length"),
-                sample_rate=self.audio.info.get("sample_rate"),
-                bitrate=self.audio.info.get("bitrate"),
-                bits_per_sample=self.audio.info.get("bits_per_sample"),
-                channels=self.audio.info.get("channels"),
-            )
+        if self.audio is not None and self.audio_type is not None:
+            match self.audio_type:
+                case AudioType.FLAC:
+                    self.metadata = AudioMetadata(
+                        title=self.audio.get('title'),
+                        artist=self.audio.get('artist'),
+                        album=self.audio.get('album'),
+                        albumartist=self.audio.get('albumartist'),
+                        genre=self.audio.get('genre'),
+                        year=self.audio.get('date'),
+                        track=self.audio.get('tracknumber'),
+                        disc=self.audio.get('discnumber'),
+                        comment=self.audio.get('comment'),
+                        lyrics=self._extract_lyrics()
+                    )
+                case AudioType.MP3:
+                    track_raw = self.audio.get('TRCK', '0')
+                    disc_raw = self.audio.get('TPOS', '0')
+                    self.metadata = AudioMetadata(
+                        title=self._id3_gettext_or_none('TIT2'),
+                        artist=self._id3_gettext_or_none('TPE1'),
+                        album=self._id3_gettext_or_none('TALB'),
+                        albumartist=self._id3_gettext_or_none('TPE2'),
+                        genre=self._id3_gettext_or_none('TCON'),
+                        year=self._id3_gettext_or_none('TDRC'),
+                        track=str(track_raw if track_raw else 0), # type: ignore
+                        disc=str(disc_raw if disc_raw else 0), # type: ignore
+                        comment=self._id3_gettext_or_none('COMM'),
+                        lyrics=self._extract_lyrics()
+                    )
+                case _ as unreachable:
+                    never_value: Never = unreachable
+                    raise ValueError(f"提取元数据时出现未实现的格式{never_value}")
+        else:
+            raise RuntimeError(f"audio未成功初始化，文件路径：{self.path}")
+    
+    def _id3_gettext_or_none(self, key: str) -> Optional[str]:
+        # 从ID3标签中获取文本内容，如果不存在则返回None
+        content = self.audio.get(key)
+        if content is None:
+            return None
+        else:
+            return str(content)
 
     def _extract_lyrics(self) -> Optional[str]:
         lyrics: Optional[str] = None
@@ -86,18 +128,26 @@ class AudioHandler:
             audio_type = AudioType(self.audio_type)
             match audio_type:
                 case AudioType.FLAC:
-                    lyrics = self.audio.get('lyrics') # flac格式直接获取歌词
+                    lyrics = self.audio.get('lyrics')[0] # flac格式直接获取歌词，只获取第一条歌词
                 case AudioType.MP3:
-                    # MP3: 遍历 frames 查找 USLT 帧
-                    for frame in self.audio.values():
-                        # USLT = Unsynchronised Lyrics/Text
-                        if hasattr(frame, 'frameid') and frame.frameid == 'USLT':
-                            lyrics =  frame.text
+                    # 遍历所有键找歌词相关
+                    for key in self.audio.keys():
+                        if 'lyrics' in key.lower() or 'unsync' in key.lower() or 'uslt' in key.lower():
+                            frame = self.audio.get(key)
+                            if hasattr(frame, 'text'):
+                                    lyrics = frame.text
+                                    break
                 case _ as unreachable:
-                    never_type: Never = unreachable
-                    raise ValueError(f"提取歌词时出现未实现的格式{never_type}")
+                    never_value: Never = unreachable
+                    raise ValueError(f"提取歌词时出现未实现的格式{never_value}")
         else:
             raise RuntimeError('audio未正确初始化，请检查代码逻辑。')
         return lyrics
 
-    
+
+if __name__ == "__main__":
+    # file = Path('test_music/test.flac')
+    file = Path('test_music/ya.mp3')
+    a = AudioHandler(file)
+    s = a.get_lyrics()
+    print(s)
